@@ -1,8 +1,9 @@
 use libc::{c_uint, size_t};
-use std::{fmt, ptr, result};
+use std::{fmt, ptr, result, mem};
 use std::ffi::CString;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+use std::os::fd::RawFd;
 #[cfg(windows)]
 use std::ffi::OsStr;
 use std::path::Path;
@@ -12,9 +13,8 @@ use ffi;
 
 use error::{Result, lmdb_result};
 use database::Database;
-use stat::Stat;
 use transaction::{RoTransaction, RwTransaction, Transaction};
-use flags::{DatabaseFlags, EnvironmentFlags};
+use flags::{DatabaseFlags, EnvironmentCopyFlags, EnvironmentFlags};
 
 #[cfg(windows)]
 /// Adding a 'missing' trait from windows OsStrExt
@@ -139,6 +139,13 @@ impl Environment {
         }
     }
 
+    /// Make a consistent copy of the environment to the given file descriptor.
+    pub fn copy_to_fd(&self, fd: RawFd, flags: EnvironmentCopyFlags) -> Result<()> {
+        unsafe {
+            lmdb_result(ffi::mdb_env_copyfd2(self.env(), fd, flags.bits()))
+        }
+    }
+
     /// Closes the database handle. Normally unnecessary.
     ///
     /// Closing a database handle is not necessary, but lets `Transaction::open_database` reuse the
@@ -159,10 +166,53 @@ impl Environment {
     /// Retrieves statistics about this environment.
     pub fn stat(&self) -> Result<Stat> {
         unsafe {
-            let mut stat = Stat::new();
-            lmdb_try!(ffi::mdb_env_stat(self.env(), stat.stat()));
+            let mut stat = Stat(mem::zeroed());
+            lmdb_try!(ffi::mdb_env_stat(self.env(), &mut stat.0));
             Ok(stat)
         }
+    }
+}
+
+/// Environment statistics.
+///
+/// Contains information about the size and layout of an LMDB environment.
+pub struct Stat(ffi::MDB_stat);
+
+impl Stat {
+    /// Size of a database page. This is the same for all databases in the environment.
+    #[inline]
+    pub fn page_size(&self) -> u32 {
+        self.0.ms_psize
+    }
+
+    /// Depth (height) of the B-tree.
+    #[inline]
+    pub fn depth(&self) -> u32 {
+        self.0.ms_depth
+    }
+
+    /// Number of internal (non-leaf) pages.
+    #[inline]
+    pub fn branch_pages(&self) -> usize {
+        self.0.ms_branch_pages
+    }
+
+    /// Number of leaf pages.
+    #[inline]
+    pub fn leaf_pages(&self) -> usize {
+        self.0.ms_leaf_pages
+    }
+
+    /// Number of overflow pages.
+    #[inline]
+    pub fn overflow_pages(&self) -> usize {
+        self.0.ms_overflow_pages
+    }
+
+    /// Number of data items.
+    #[inline]
+    pub fn entries(&self) -> usize {
+        self.0.ms_entries
     }
 }
 
@@ -419,5 +469,28 @@ mod test {
         assert_eq!(stat.leaf_pages(), 1);
         assert_eq!(stat.overflow_pages(), 0);
         assert_eq!(stat.entries(), 64);
+    }
+
+    #[test]
+    fn test_copy_to_fd() {
+        let dir = TempDir::new("test").unwrap();
+        let dir2 = TempDir::new("test-copy").unwrap();
+        {
+            let env = Environment::new().open(dir.path()).unwrap();
+            {
+                let db = env.open_db(None).unwrap();
+                let mut txn = env.begin_rw_txn().unwrap();
+                txn.put(db, b"key1", b"val1", WriteFlags::empty()).unwrap();
+                txn.commit().unwrap();
+            }
+
+            use std::os::unix::io::IntoRawFd;
+            let fd = std::fs::File::create(dir2.path().join("data.mdb")).unwrap().into_raw_fd();
+            env.copy_to_fd(fd, EnvironmentCopyFlags::empty()).unwrap()
+        }
+        let env = Environment::new().open(dir2.path()).unwrap();
+        let db = env.open_db(None).unwrap();
+        let txn = env.begin_ro_txn().unwrap();
+        assert_eq!(txn.get(db, b"key1").unwrap(), b"val1");
     }
 }
