@@ -52,6 +52,11 @@ pub trait Cursor<'txn> {
         Iter::new(self.cursor(), ffi::MDB_FIRST, ffi::MDB_NEXT)
     }
 
+    /// Iterate over database items, from end to beginning of the database.
+    fn iter_end(&mut self) -> Iter<'txn> {
+        Iter::new(self.cursor(), ffi::MDB_LAST, ffi::MDB_PREV)
+    }
+
     /// Iterate over database items starting from the given key.
     ///
     /// For databases with duplicate data items (`DatabaseFlags::DUP_SORT`), the
